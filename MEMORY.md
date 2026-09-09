@@ -119,3 +119,61 @@ global `project-memory` skill rather than in this repo's decision log.
 **Next:** first checkpoint — `.\scripts\checkpoint.ps1 "bootstrap project-memory system"` — then
 back to Phase 0. `configs/`, `tests/` and `.github/` are still empty; `tests/` in particular blocks
 the Phase 0 exit criterion.
+
+---
+
+## 2026-09-09 — Phase 0 complete: eval spine, ledger, registry, CLI, CI gate
+
+**What:** Phase 0 is done and its exit criterion is met. `configs/`, `tests/` and `.github/` are
+no longer empty. 223 tests pass; `ruff check .` clean; `check_no_fake_code.py` reports 0
+violations and 0 escapes across all of `src/`.
+
+Landed, in dependency order:
+
+- `eval/` — span-anchored relevance with an explicit `OverlapSpec` (rule + threshold, no
+  signature defaults), append-only versioned qrels as full snapshots, TREC-style persisted run
+  files with a `rescore()` that needs no index/corpus/model, and paired bootstrap +
+  randomization tests gated on a pre-registered minimum effect size.
+- `registry.py` — `Component` ABC, `config_id`, and two real reference components
+  (`chunker.fixed`, `query_transform.passthrough`).
+- `ledger.py` — DuckDB; `run_metrics` stores **per-query** values, not means.
+- `paths.py`, `cli.py` (`doctor`, `registry list`, `ledger`, `config validate`, `version`),
+  `scripts/check_no_fake_code.py`, `.github/workflows/ci.yml`, `configs/baseline.yaml`.
+
+**Why:** the harness was built before any retrieval code deliberately. Without it, "try every
+technique" has no stopping condition and no way to tell a real improvement from noise. The single
+most valuable artefact here is the persisted run file: error analysis reliably finds 10–20% bad
+qrels, and when they are corrected this turns "re-run 40 configs" into "re-score 40 configs" —
+days into seconds.
+
+**Decisions:** `config_id` now covers a component's declared `version`, not just its config
+values, and renders as `fixed.v1@0b9b5476`. See below; not yet a full ADR because it refines
+[0003](decisions/0003-chunk-ids-hash-coordinates-not-text.md) rather than standing alone.
+
+**Failures:**
+
+- Caught in review, before it could do damage: `config_id` originally hashed only config *values*.
+  Since `config_id` feeds `chunk_uid`, a chunker whose implementation changed while its config
+  stayed byte-identical would have produced **the same chunk ids for different text** — two index
+  generations silently sharing ids, stale vectors surviving a re-index, tombstones never firing,
+  and blue/green diffs reporting no change. Precisely the failure class the id scheme exists to
+  prevent. Fixed by adding a `version` ClassVar that participates in the hash *and* is visible in
+  the label. Free to fix now; expensive after the first index is built.
+- `nDCG` uses **linear** gain while much of the literature uses `2**grade - 1`. Internal
+  comparisons are unaffected, but our numbers are not comparable to published ones without
+  checking. Documented in the docstring rather than changed, since consistency matters more than
+  matching any one paper.
+- Two environment failures cost real time and are logged as
+  [ERR-0001](ERRORS.md) and in [CLAUDE.md](CLAUDE.md): bash heredocs mangle Python containing
+  backticks/apostrophes (write files with the Write tool), and `uv` silently resolves to the
+  Windows Store Python unless given `--python ./.venv/Scripts/python.exe`.
+
+**Observation from `selfrag doctor`:** available RAM was **1.12 GB**, against the 3 GB this
+project's local-model tier assumes. With the editor and a browser open there is far less headroom
+than the plan's arithmetic assumed. This does not block Phase 1, but the dev-corpus size and ORT
+thread count will need measuring on a quiet machine rather than trusting the estimate.
+
+**Next:** Phase 1 — corpus. Streaming OAI-PMH metadata harvest into Parquet (the arXiv snapshot is
+a 4–5 GB JSONL and must never be materialised), LaTeX e-print parsing with a PyMuPDF fallback,
+frozen canonical text, and base-id + MinHash deduplication. Exit criterion: re-running ingest
+produces **zero** new chunk ids.

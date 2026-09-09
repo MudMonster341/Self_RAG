@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref so pushes during review don't queue
+# up redundant jobs behind each other.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: lint, gate, and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+          cache-dependency-glob: "pyproject.toml"
+
+      - name: Install project (editable, with dev extras)
+        run: uv pip install --system -e ".[dev]"
+
+      - name: ruff check
+        run: ruff check .
+
+      - name: No-fake-code gate
+        run: python scripts/check_no_fake_code.py
+
+      - name: pytest
+        run: pytest -q

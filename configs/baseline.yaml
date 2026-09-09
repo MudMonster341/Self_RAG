@@ -1,0 +1,37 @@
+# Baseline pipeline config.
+#
+# This is a *real* config `selfrag config validate configs/baseline.yaml`
+# accepts today -- not a placeholder for a future phase. It exercises the
+# two reference components that ship in selfrag.registry (the "fixed"
+# chunker and the "passthrough" query transform) end to end, hashing them
+# into a concrete run_id.
+#
+# Fields that would normally come from a parser/embedder/dedup component are
+# given directly as literal ids below, because no such components are
+# registered yet (see selfrag.registry) -- Phase 0 does not stub those
+# stages, it simply names them by hand until a real implementation exists to
+# validate against.
+
+corpus_snapshot: "manual-2026-09-09"
+dedup_config_id: "none"
+parser_id: "manual@v1"
+embedder_id: "manual@v1"
+embedder_snapshot_date: "2026-09-09"
+embedding_dim: 8
+quantization: "none"
+
+qrels_version: 1
+split: dev
+seed: 0
+
+stages:
+  chunker:
+    name: fixed
+    config:
+      chunk_size: 512
+      overlap: 64
+  query_transform:
+    name: passthrough
+    config: {}
+
+notes: "Phase 0 baseline: fixed chunker + passthrough query transform, everything else manual."

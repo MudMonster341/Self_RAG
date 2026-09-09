@@ -28,21 +28,35 @@ uncovered.
 
 ## Current state
 
-**Phase 0 — Foundations. In progress.**
+**Phase 0 — Foundations. Complete** (2026-09-09).
 
-Landed: git repo initialised with `origin` pointing at GitHub; first commit `306f931`;
-`src/selfrag/ids.py` (identity functions) and `src/selfrag/schema.py` (core Pydantic models);
-`README.md`, `CLAUDE.md`, `.gitignore`, `.env.example`; the project-memory files you are reading.
+**223 tests pass**, `ruff check .` is clean, and `scripts/check_no_fake_code.py` reports 0
+violations and 0 escapes across `src/`.
 
-Not yet built: `registry.py`, `ledger.py`, `cli.py`, `eval/`, the `configs/` pipeline
-definitions, `tests/`, and the CI no-fake-code gate. `configs/`, `tests/` and `.github/` exist
-but are empty.
+Landed:
 
-**Phase 0 exits when** `selfrag run --config baseline.yaml` runs end to end on 10 documents and
-writes a row to the ledger. Phases 0–3 need **zero API keys**.
+| Module | What it does |
+|---|---|
+| `ids.py` | Identity functions. `chunk_uid` hashes coordinates, never text. |
+| `schema.py` | Core models; multimodal locator fields reserved as nullable. |
+| `eval/` | Span-anchored relevance, versioned qrels, persisted run files, paired statistics. |
+| `registry.py` | Components + `config_id`; two real reference components. |
+| `ledger.py` | DuckDB. `run_metrics` holds **per-query** values, never means. |
+| `paths.py`, `cli.py` | Path resolution; `doctor`, `registry list`, `ledger`, `config validate`. |
+| `scripts/`, `.github/` | No-fake-code gate and CI. |
 
-Next after that: Phase 1 corpus ingest, then Phase 2 the eval harness — which is the real start
-of the project, because nothing before it is falsifiable.
+`selfrag config validate configs/baseline.yaml` resolves both stages and produces a concrete
+`run_id`. **Phase 0's exit criterion is met.**
+
+There is no corpus and no retrieval yet — that is Phase 1, and it is the next thing.
+Phases 0–3 need **zero API keys**.
+
+⚠ **Unpushed.** Commits are local only; `git push` needs a one-time interactive credential
+login (Git Credential Manager opens a browser). Until then GitHub is not a backup.
+
+⚠ **RAM is tighter than planned.** `selfrag doctor` measured **1.12 GB available** against the
+3 GB the local-model tier assumes. Measure the dev-corpus size and ORT thread count on a quiet
+machine before trusting the plan's throughput arithmetic.
 
 ## How to run it
 
