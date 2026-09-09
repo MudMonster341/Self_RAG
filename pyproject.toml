@@ -1,0 +1,72 @@
+[project]
+name = "selfrag"
+version = "0.1.0"
+description = "A production-grade, falsifiable RAG system over a self-referential research corpus."
+requires-python = ">=3.12"
+readme = "README.md"
+
+dependencies = [
+    "pydantic>=2.7",
+    "duckdb>=1.1",
+    "pyarrow>=16",
+    "numpy>=1.26",
+    "typer>=0.12",
+    "rich>=13",
+    "pyyaml>=6",
+    "orjson>=3.10",
+    "ijson>=3.2",
+    "httpx>=0.27",
+    "tenacity>=8.2",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+retrieval = [
+    "bm25s>=0.2",
+    "lancedb>=0.13",
+    "onnxruntime>=1.18",
+    "tokenizers>=0.19",
+    "huggingface-hub>=0.24",
+]
+parse = [
+    "pymupdf4llm>=0.0.17",
+    "datasketch>=1.6",
+]
+serve = [
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "mcp>=1.0",
+]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+selfrag = "selfrag.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/selfrag"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q --strict-markers"
+markers = [
+    "slow: takes more than a few seconds",
+    "network: requires network access",
+    "paid: makes a paid API call",
+]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]

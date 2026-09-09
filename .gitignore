@@ -1,0 +1,32 @@
+# Data — never committed. Corpus is not redistributable (arXiv TOU).
+data/*
+!data/.gitkeep
+*.parquet
+*.duckdb
+*.duckdb.wal
+*.lance/
+models/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
