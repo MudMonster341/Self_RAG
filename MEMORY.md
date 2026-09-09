@@ -177,3 +177,11 @@ thread count will need measuring on a quiet machine rather than trusting the est
 a 4–5 GB JSONL and must never be materialised), LaTeX e-print parsing with a PyMuPDF fallback,
 frozen canonical text, and base-id + MinHash deduplication. Exit criterion: re-running ingest
 produces **zero** new chunk ids.
+
+**Session end (2026-09-09 23:20):** session was ending on usage limits with Phase 1 not started.
+Rather than stopping, a one-time scheduled task `selfrag-phase1-resume` was armed for
+**03:14 local** (4 min after the stated 03:10 reset, so the reset has definitely landed). It
+starts a *fresh* run with no conversation memory and orients purely from these files — which is
+the first real test of whether this memory system does its job. Scope is deliberately capped: a
+pilot ingest of ≤300 papers, no paid API calls. The generalised rule now lives in the global
+`project-memory` skill under "Session continuity".
