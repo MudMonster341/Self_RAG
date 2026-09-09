@@ -240,6 +240,17 @@ def ndcg_at_k(
 ) -> float | None:
     """Normalised discounted cumulative gain at k, standard log2 discount.
 
+    Gain is **linear** (``gain = grade``), the original Jarvelin-Kekalainen
+    formulation. Much of the IR literature -- and several popular toolkits --
+    instead use exponential gain (``2**grade - 1``), which weights grade-3
+    spans far more heavily. The two conventions are not comparable.
+
+    This matters in one specific way: internal config-vs-config comparisons are
+    unaffected, because the convention is held constant across every run. But
+    an nDCG@10 reported here must NOT be placed side by side with an nDCG@10
+    quoted from a paper without first checking which gain that paper used.
+    Record the convention whenever a number leaves this repo.
+
     IDCG is computed from the gold grades themselves (sorted descending,
     truncated to k) -- the ideal ranking places every relevant span as early
     as retrieval allows, regardless of what was actually retrieved.
