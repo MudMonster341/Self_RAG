@@ -185,3 +185,28 @@ starts a *fresh* run with no conversation memory and orients purely from these f
 the first real test of whether this memory system does its job. Scope is deliberately capped: a
 pilot ingest of ≤300 papers, no paid API calls. The generalised rule now lives in the global
 `project-memory` skill under "Session continuity".
+
+---
+
+## 2026-09-10 — Overnight run produced nothing; machine slept through it
+
+**What:** the `selfrag-phase1-resume` task fired on time at 03:14 and accomplished nothing.
+Zero commits, empty `data/`, no log. Phase 1 has not been started. The repo is exactly where
+it was at 23:20 last night: 6 commits, Phase 0 complete, 223 tests passing (re-verified this
+morning after Windows rebooted the machine — ruff and the no-fake-code gate are clean too, so
+the OS upgrade broke nothing).
+
+**Why it failed:** the machine entered Modern Standby at 23:20:41 and did not wake until
+06:38. See [ERR-0002](ERRORS.md). Two compounding factors: the app's scheduler arms an
+in-process timer, not an RTC wake timer, so it cannot wake a sleeping machine; and Windows
+Update rebooted the box three times around 04:30 regardless.
+
+**The reframe this forces:** the unpushed remote is no longer just a missing backup, it is
+what blocks the only reliable form of unattended work. A cloud routine does not care whether
+this machine is awake, but it needs a repo to clone. Pushing is now on the critical path.
+
+**Failures:** the risk was explicitly recorded in the plan's Known Open Risks and then not
+acted on before scheduling. Writing a risk down is not mitigating it — the check ("is this
+machine configured to stay awake?") was one command and was not run.
+
+**Next:** unblock the push, then Phase 1 corpus ingest.
