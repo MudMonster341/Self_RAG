@@ -411,7 +411,14 @@ class IngestReport:
     n_parsed: int
     n_failed: int
     n_skipped: int
-    n_chunks_created: int
+    # Chunks in the corpus after this run, and how many of those were newly
+    # written. They differ on every re-ingest: a skipped document is still
+    # re-chunked from its frozen canonical text (cheap, no network), so the
+    # total stays constant while new drops to zero. Reporting only the total
+    # makes an idempotent re-run look like it duplicated the whole corpus,
+    # which is precisely the number someone checks idempotency against.
+    n_chunks_total: int
+    n_chunks_new: int
     n_chunks_duplicate: int
     parse_quality: dict[str, float] | None
     elapsed_seconds: float
@@ -504,7 +511,8 @@ def run_ingest(
             n_parsed=0,
             n_failed=0,
             n_skipped=len(doc_ids) - to_acquire,
-            n_chunks_created=0,
+            n_chunks_total=0,
+            n_chunks_new=0,
             n_chunks_duplicate=0,
             parse_quality=None,
             elapsed_seconds=elapsed,
@@ -610,6 +618,10 @@ def run_ingest(
         for chunk in all_chunks
     ]
 
+    # Snapshot before writing so "new" means genuinely new, not merely upserted.
+    known_chunk_ids = ledger.get_chunk_ids()
+    n_chunks_new = sum(1 for c in final_chunks if c.chunk_uid not in known_chunk_ids)
+
     ledger.upsert_documents(documents_to_persist)
     ledger.upsert_chunks(final_chunks)
 
@@ -627,7 +639,8 @@ def run_ingest(
         n_parsed=n_parsed,
         n_failed=n_failed,
         n_skipped=n_skipped,
-        n_chunks_created=len(final_chunks),
+        n_chunks_total=len(final_chunks),
+        n_chunks_new=n_chunks_new,
         n_chunks_duplicate=n_duplicate,
         parse_quality=aggregate_reports(quality_reports) if quality_reports else None,
         elapsed_seconds=elapsed,

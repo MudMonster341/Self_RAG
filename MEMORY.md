@@ -264,3 +264,41 @@ rate-limited network operation this session did not run). `selfrag doctor` still
 
 **Next:** a real pilot ingest (≤300 papers per the earlier Phase 1 resume plan) against live arXiv,
 then Phase 2 — retrieval.
+
+---
+
+## 2026-09-10 — Phase 1 complete, and proven on a real corpus rather than fixtures
+
+**What:** the first real corpus is ingested. Twelve foundational retrieval/RAG papers
+(`configs/pilot.yaml`) — RAG, REALM, FiD, Self-RAG, DPR, Contriever, E5, BGE, BEIR, Late
+Chunking, ColBERT, plus one from our own live cs.IR harvest — through the full pipeline:
+acquire → parse → freeze → quality → chunk → dedup → persist.
+
+    12/12 acquired and parsed, 0 failures, 1343 chunks, 35.3s
+    section-label coverage 99.68% · unexpanded_macro_rate 2.06% · broken math 0.92%
+
+35.3s for 12 papers is essentially the arXiv throttle (12 × 3s); the pipeline itself is nearly
+free. Re-running: 0 acquired, 0 parsed, 12 skipped, **0 chunks newly written**, 1.9s. Ledger
+confirms 1343 distinct chunk ids against 1343 rows after three consecutive runs.
+
+**Why it matters that this was run for real:** the exit criterion was already proven on a
+fixture corpus, and that was not enough. Twice today a fully-passing test suite hid a defect
+that the first contact with reality exposed in seconds — [ERR-0003](ERRORS.md) (arXiv moved its
+OAI-PMH endpoint; 65 mocked transport tests could not see it) and the LaTeX parser defects
+(102 fixture tests passed while real papers produced nested sibling headings and 75 unexpanded
+macros). Fixtures prove the code is self-consistent. They cannot prove it meets the world.
+
+**Failures:** one reporting defect found by running it. `chunks created` reported 1343 on a run
+that parsed zero documents, because a skipped document is still re-chunked from its frozen
+canonical text — correct behaviour, misleading label, and precisely the number a person reads to
+decide whether a re-ingest duplicated the corpus. Split into `chunks in corpus` and `chunks
+newly written`. The second now reads 0 on a re-run, which is the claim being made.
+
+**Decisions:** [ADR 0006](decisions/0006-span-integrity-failure-aborts-ingest-rather-than-dead-lettering.md)
+— a chunk that fails to round-trip through `canonical.get_span` aborts the run instead of being
+dead-lettered, because it indicates a systemic bug rather than a bad document.
+
+**Next:** Phase 2, the evaluation harness — and the corpus decision described in the reference
+artifact. Swapping corpora is cheap now and expensive once human relevance judgements exist,
+because judgements are corpus-specific and roughly ten hours of work. That fork is Phase 2's
+first question, not a later one.

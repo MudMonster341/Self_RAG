@@ -1,0 +1,53 @@
+# Phase 1 pilot ingest -- the first real corpus.
+#
+# Twelve foundational retrieval / RAG papers, chosen so the corpus is
+# immediately useful for its own purpose: these are the works the system's
+# design decisions actually cite. Deliberately small. The point of the pilot is
+# to prove the pipeline against *real* arXiv LaTeX -- conference style files,
+# macro soup, \input trees -- not to build scale. Scale comes after the eval
+# harness exists to tell us whether any of it helped.
+#
+# Fetching is throttled to one request per three seconds by arxiv_client, per
+# arXiv's Terms of Use. Twelve papers is therefore ~40s of throttle plus
+# download. Nothing here is redistributed; data/ is gitignored.
+
+corpus_name: pilot
+namespace: papers
+
+doc_ids:
+  # Retrieval-augmented generation
+  - "2005.11401"   # RAG (Lewis et al.)
+  - "2002.08909"   # REALM
+  - "2007.01282"   # Fusion-in-Decoder
+  - "2310.11511"   # Self-RAG (Asai et al.) -- the technique, not this project
+
+  # Dense retrieval and embeddings
+  - "2004.04906"   # DPR
+  - "2112.09118"   # Contriever
+  - "2212.03533"   # E5
+  - "2308.03281"   # BGE / C-Pack
+
+  # Evaluation and benchmarks
+  - "2104.08663"   # BEIR
+
+  # Chunking and long-context retrieval
+  - "2409.04701"   # Late Chunking
+
+  # Reranking / late interaction
+  - "2004.12832"   # ColBERT
+
+  # Recent, from our own live cs.IR harvest
+  - "2505.16532"
+
+chunker:
+  name: fixed
+  config:
+    chunk_size: 512
+    overlap: 64
+
+dedup:
+  enabled: true
+  jaccard_threshold: 0.85
+  shingle_size: 5
+
+max_extracted_bytes: 209715200

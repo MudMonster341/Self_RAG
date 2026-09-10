@@ -177,10 +177,10 @@ class TestHappyPath:
         assert report.n_seen == 2
         assert report.n_parsed == 2
         assert report.n_failed == 0
-        assert report.n_chunks_created > 0
+        assert report.n_chunks_total > 0
         assert report.parse_quality is not None
         assert len(ledger.live_documents()) == 2
-        assert ledger.count_chunks() == report.n_chunks_created
+        assert ledger.count_chunks() == report.n_chunks_total
 
     def test_document_row_records_which_parser_ran(self, data_dir, ledger, manifest_path, tmp_path):
         source = FixtureSource(latex_docs={"docX": _write_tex(tmp_path, "x", _DOC_SIMPLE_TEX)})
