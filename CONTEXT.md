@@ -75,9 +75,6 @@ retrieval yet — retrieval is Phase 2. Phases 0–3 need **zero API keys**; Pha
 does call the live arXiv API when not run with `--dry-run`, subject to the 1-req/3s throttle
 already enforced by `arxiv_client.py`.
 
-⚠ **Unpushed.** Commits are local only; `git push` needs a one-time interactive credential
-login (Git Credential Manager opens a browser). Until then GitHub is not a backup.
-
 ⚠ **RAM is still tight.** `selfrag doctor` measures **~1.2–1.3 GB available** against the 3 GB
 the local-model tier assumes — unchanged since Phase 0. Measure the dev-corpus size and ORT
 thread count on a quiet machine before trusting the plan's throughput arithmetic.
