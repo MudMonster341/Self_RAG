@@ -1,0 +1,34 @@
+# Phase 1 ingest pipeline config.
+#
+# `selfrag ingest run --config configs/ingest.yaml` acquires, parses,
+# freezes, chunks, dedups, and persists every doc_id below into the "dev"
+# corpus ledger. Deliberately small: the Phase 1 exit criterion (re-running
+# ingest adds zero new chunk ids) is proven on a fixture corpus in
+# tests/integration/test_ingest_idempotency.py, not by the length of this
+# list -- this file just needs to be a real, validating config, which
+# `selfrag config validate` style checking (via IngestConfig) enforces the
+# same way configs/baseline.yaml does for a retrieval RunManifest.
+#
+# Grow doc_ids toward the pilot ingest (<=300 papers, per MEMORY.md) once a
+# real OAI-PMH harvest (selfrag.ingest.oaipmh, owned elsewhere) has
+# populated a candidate list -- this file does not attempt that harvest
+# itself, since doing so is a network operation outside this config's job.
+
+corpus_name: dev
+namespace: papers
+
+doc_ids:
+  - "2401.01234"
+
+chunker:
+  name: fixed
+  config:
+    chunk_size: 512
+    overlap: 64
+
+dedup:
+  enabled: true
+  jaccard_threshold: 0.85
+  shingle_size: 5
+
+max_extracted_bytes: 209715200

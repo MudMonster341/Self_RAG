@@ -210,3 +210,57 @@ acted on before scheduling. Writing a risk down is not mitigating it — the che
 machine configured to stay awake?") was one command and was not run.
 
 **Next:** unblock the push, then Phase 1 corpus ingest.
+
+---
+
+## 2026-09-10 — Phase 1: the ingest pipeline orchestrator, and its exit criterion
+
+**What:** built `src/selfrag/ingest/pipeline.py`, wiring every existing `ingest/` module (manifest,
+arxiv_client, eprint, latex, pdf_fallback, canonical, dedup, quality) into one flow: seed manifest
+→ acquire → parse (LaTeX, PDF fallback) → freeze canonical → assess quality → chunk (via registry)
+→ dedup → persist → record run. Extended `ledger.py` with document/chunk persistence
+(`upsert_documents`/`upsert_chunks`, batched via a registered Arrow table and `ON CONFLICT DO
+UPDATE` — not row-by-row) and ingest-run bookkeeping, and added `selfrag ingest run/status/quality`
+to the CLI. 495 tests pass (452 → 495), `ruff` and the no-fake-code gate are clean.
+
+**Phase 1's exit criterion is met**: `tests/integration/test_ingest_idempotency.py` proves that
+re-ingesting the same fixture corpus (twice, then a third time for good measure) adds zero new
+chunk ids, zero duplicate ledger rows, identical canonical-text hashes, identical document rows,
+and zero re-acquisition of already-acquired documents — entirely via `httpx`-free fixtures, no
+network reachable from the test.
+
+**Design decisions:**
+
+- **Idempotency needed no new tracking layer.** A document already `PARSED` in the manifest is
+  never re-acquired or re-parsed — its canonical text is already frozen and immutable (invariant
+  4), so quality assessment and chunking just re-read that frozen text every run. Recomputing the
+  same deterministic thing and upserting it is indistinguishable, to the ledger, from computing it
+  once. A document `ACQUIRED` but not yet `PARSED` (process died mid-pipeline on a prior run)
+  resumes by re-locating its files under the same deterministic `dest_root/doc_id` layout, never by
+  re-fetching — proven directly in a test that gives the fixture source zero registered fixtures
+  for that doc_id and asserts `acquire()` was still never called.
+- **Canonical text's write-once invariant reframes what "a changed document" can mean.**
+  `freeze_canonical` refuses to re-freeze a `doc_id` under different text (by design, pre-existing).
+  So the "changed source document produces new chunk ids" test models the only kind of change this
+  architecture allows: a document that failed *before* any canonical text was ever frozen for it,
+  fixed, and retried — never a same-doc_id content mutation.
+- **A span-integrity failure aborts the whole run rather than being dead-lettered.** Every other
+  per-document failure (acquire/parse/freeze/chunk) is caught, recorded via `mark_failed`, and the
+  run continues — but a chunk whose stored text does not round-trip through
+  `canonical.get_span(start, end)` can only mean a systemic bug (the shared chunker, or corrupted
+  canonical text), not a property of one unlucky document, so `SpanIntegrityError` is deliberately
+  excluded from the dead-letter `except` blocks. See
+  [ADR 0006](decisions/0006-span-integrity-failure-aborts-ingest-rather-than-dead-lettering.md).
+- **`chunks.tombstoned_at` is a real column, not a join against `documents.tombstoned_at`.** Bumped
+  the ledger schema to v2 and exercised the forward-only migration mechanism for the first time
+  (`_migrate_v1_to_v2`, tested against a hand-built v1 database). A per-chunk timestamp makes
+  removal auditable at the row a future embedding-cache invalidation would actually key off, and
+  `upsert_chunks` never writes that column, so an ordinary re-ingest can never clear a tombstone.
+
+**Not done, deliberately out of scope:** no real corpus was ingested (`configs/ingest.yaml` still
+names one placeholder doc_id — populating it needs a live OAI-PMH harvest, a paid-free but
+rate-limited network operation this session did not run). `selfrag doctor` still reports the same
+~1.2–1.3 GB available RAM as at Phase 0 exit; unchanged, not re-investigated.
+
+**Next:** a real pilot ingest (≤300 papers per the earlier Phase 1 resume plan) against live arXiv,
+then Phase 2 — retrieval.

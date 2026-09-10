@@ -11,10 +11,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import duckdb
 import pytest
 
-from selfrag.ledger import ConstraintViolation, Ledger, LedgerConflictError
-from selfrag.schema import Constraints, RunManifest, Split
+from selfrag.ledger import ConstraintViolation, Ledger, LedgerConflictError, _migrate_v1_to_v2
+from selfrag.schema import Chunk, Constraints, Document, Namespace, RunManifest, Split
 
 
 def _make_manifest(**overrides) -> RunManifest:
@@ -49,7 +50,7 @@ class TestSchemaCreation:
 
     def test_schema_version_row_exists(self, ledger):
         row = ledger._conn.execute("SELECT version FROM schema_version").fetchone()
-        assert row == (1,)
+        assert row == (2,)  # bumped for chunks.tombstoned_at -- see _migrate_v1_to_v2
 
     def test_all_required_tables_exist(self, ledger):
         tables = {
@@ -287,3 +288,254 @@ class TestRecordError:
         ledger.record_error(None, "ingest", "could not parse pdf")
         rows = ledger._conn.execute("SELECT stage, message FROM errors WHERE run_id IS NULL").fetchall()
         assert rows == [("ingest", "could not parse pdf")]
+
+
+class TestSchemaMigration:
+    def test_v1_database_is_upgraded_to_v2_with_tombstoned_at_column(self, tmp_path):
+        """Simulates a database created before chunks.tombstoned_at existed:
+        build the v1 shape by hand, stamp schema_version=1, then open it
+        through Ledger and confirm the migration ran instead of erroring."""
+        db_path = tmp_path / "old.duckdb"
+        conn = duckdb.connect(str(db_path))
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        conn.execute("INSERT INTO schema_version VALUES (1)")
+        conn.execute(
+            """
+            CREATE TABLE chunks (
+                chunk_uid VARCHAR PRIMARY KEY,
+                doc_id VARCHAR NOT NULL,
+                chunker_config_id VARCHAR NOT NULL,
+                char_start INTEGER NOT NULL,
+                char_end INTEGER NOT NULL,
+                raw_text_sha256 VARCHAR,
+                dup_of VARCHAR
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO chunks VALUES ('c1', 'd1', 'fixed@aaaa', 0, 10, 'h', NULL)"
+        )
+        conn.close()
+
+        with Ledger(db_path) as led:
+            version = led._conn.execute("SELECT version FROM schema_version").fetchone()[0]
+            assert version == 2
+            columns = {
+                r[0]
+                for r in led._conn.execute(
+                    "SELECT column_name FROM information_schema.columns WHERE table_name = 'chunks'"
+                ).fetchall()
+            }
+            assert "tombstoned_at" in columns
+            # the pre-existing row survived the ALTER TABLE untouched
+            row = led._conn.execute(
+                "SELECT chunk_uid, tombstoned_at FROM chunks WHERE chunk_uid = 'c1'"
+            ).fetchone()
+            assert row == ("c1", None)
+
+    def test_migrate_v1_to_v2_is_idempotent_to_call_directly(self, tmp_path):
+        """The migration function itself, exercised directly rather than
+        through a full Ledger(...) open -- guards the function's own SQL,
+        independent of the version-bookkeeping that decides when it runs."""
+        db_path = tmp_path / "bare.duckdb"
+        conn = duckdb.connect(str(db_path))
+        conn.execute(
+            "CREATE TABLE chunks (chunk_uid VARCHAR PRIMARY KEY, doc_id VARCHAR, "
+            "chunker_config_id VARCHAR, char_start INTEGER, char_end INTEGER, "
+            "raw_text_sha256 VARCHAR, dup_of VARCHAR)"
+        )
+        _migrate_v1_to_v2(conn)
+        columns = {
+            r[0]
+            for r in conn.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = 'chunks'"
+            ).fetchall()
+        }
+        assert "tombstoned_at" in columns
+        conn.close()
+
+
+def _make_document(doc_id: str = "2401.00001", **overrides) -> Document:
+    defaults = dict(
+        doc_id=doc_id,
+        namespace=Namespace.PAPERS,
+        source_url=f"https://arxiv.org/abs/{doc_id}",
+        title="A Test Paper",
+        doc_text_sha256="deadbeef",
+        parser_id="latex",
+        char_len=1000,
+        ingest_run_id="ingest-test",
+    )
+    defaults.update(overrides)
+    return Document(**defaults)
+
+
+def _make_chunk(doc_id: str = "2401.00001", chunk_uid: str = "c1", **overrides) -> Chunk:
+    defaults = dict(
+        chunk_uid=chunk_uid,
+        doc_id=doc_id,
+        chunker_config_id="fixed.v1@aaaaaaaa",
+        char_start=0,
+        char_end=10,
+        text="0123456789",
+        raw_text_sha256="rawhash",
+    )
+    defaults.update(overrides)
+    return Chunk(**defaults)
+
+
+class TestUpsertDocuments:
+    def test_empty_sequence_is_a_no_op(self, ledger):
+        ledger.upsert_documents([])
+        assert ledger.live_documents() == []
+
+    def test_inserts_new_documents(self, ledger):
+        ledger.upsert_documents([_make_document("2401.00001"), _make_document("2401.00002")])
+        docs = ledger.live_documents()
+        assert {d.doc_id for d in docs} == {"2401.00001", "2401.00002"}
+
+    def test_upserting_the_same_doc_id_twice_updates_in_place(self, ledger):
+        ledger.upsert_documents([_make_document(title="first title")])
+        ledger.upsert_documents([_make_document(title="second title")])
+        docs = ledger.live_documents()
+        assert len(docs) == 1
+        assert docs[0].title == "second title"
+
+    def test_round_trips_every_field(self, ledger):
+        doc = _make_document(
+            doc_id="2401.00003",
+            namespace=Namespace.PROJECT,
+            source_url="https://arxiv.org/abs/2401.00003",
+            title="Round Trip",
+            doc_text_sha256="abc123",
+            parser_id="pdf_fallback",
+            char_len=42,
+            acl_key="internal",
+            ingest_run_id="ingest-xyz",
+        )
+        ledger.upsert_documents([doc])
+        fetched = ledger.get_document("2401.00003")
+        assert fetched.namespace == Namespace.PROJECT
+        assert fetched.title == "Round Trip"
+        assert fetched.doc_text_sha256 == "abc123"
+        assert fetched.parser_id == "pdf_fallback"
+        assert fetched.char_len == 42
+        assert fetched.acl_key == "internal"
+        assert fetched.ingest_run_id == "ingest-xyz"
+
+
+class TestUpsertChunks:
+    def test_empty_sequence_is_a_no_op(self, ledger):
+        ledger.upsert_chunks([])
+        assert ledger.count_chunks() == 0
+
+    def test_inserts_new_chunks(self, ledger):
+        ledger.upsert_chunks([_make_chunk(chunk_uid="c1"), _make_chunk(chunk_uid="c2")])
+        assert ledger.get_chunk_ids() == {"c1", "c2"}
+        assert ledger.count_chunks() == 2
+
+    def test_upserting_the_same_chunk_uid_twice_does_not_duplicate(self, ledger):
+        ledger.upsert_chunks([_make_chunk(chunk_uid="c1", raw_text_sha256="h1")])
+        ledger.upsert_chunks([_make_chunk(chunk_uid="c1", raw_text_sha256="h2")])
+        assert ledger.count_chunks() == 1
+        row = ledger._conn.execute(
+            "SELECT raw_text_sha256 FROM chunks WHERE chunk_uid = 'c1'"
+        ).fetchone()
+        assert row == ("h2",)
+
+    def test_get_chunk_ids_filters_by_doc_id(self, ledger):
+        ledger.upsert_chunks(
+            [
+                _make_chunk(doc_id="d1", chunk_uid="c1"),
+                _make_chunk(doc_id="d2", chunk_uid="c2"),
+            ]
+        )
+        assert ledger.get_chunk_ids(doc_id="d1") == {"c1"}
+        assert ledger.get_chunk_ids() == {"c1", "c2"}
+
+    def test_upsert_never_touches_tombstoned_at(self, ledger):
+        """Re-upserting a chunk (an ordinary idempotent re-ingest) must never
+        clear a tombstone set by a previous `tombstone_document` call."""
+        ledger.upsert_documents([_make_document("d1")])
+        ledger.upsert_chunks([_make_chunk(doc_id="d1", chunk_uid="c1")])
+        ledger.tombstone_document("d1")
+
+        ledger.upsert_chunks([_make_chunk(doc_id="d1", chunk_uid="c1", raw_text_sha256="new")])
+
+        row = ledger._conn.execute(
+            "SELECT tombstoned_at FROM chunks WHERE chunk_uid = 'c1'"
+        ).fetchone()
+        assert row[0] is not None
+
+
+class TestGetDocument:
+    def test_unknown_doc_id_raises_key_error(self, ledger):
+        with pytest.raises(KeyError):
+            ledger.get_document("nonexistent")
+
+
+class TestLiveDocuments:
+    def test_excludes_tombstoned_documents(self, ledger):
+        ledger.upsert_documents([_make_document("d1"), _make_document("d2")])
+        ledger.tombstone_document("d1")
+        assert {d.doc_id for d in ledger.live_documents()} == {"d2"}
+
+    def test_empty_ledger_has_no_live_documents(self, ledger):
+        assert ledger.live_documents() == []
+
+
+class TestTombstoneDocument:
+    def test_unknown_doc_id_raises_key_error(self, ledger):
+        with pytest.raises(KeyError):
+            ledger.tombstone_document("nonexistent")
+
+    def test_marks_rather_than_deletes(self, ledger):
+        ledger.upsert_documents([_make_document("d1")])
+        ledger.upsert_chunks([_make_chunk(doc_id="d1", chunk_uid="c1")])
+
+        ledger.tombstone_document("d1")
+
+        # still present as a row -- just marked
+        doc_row = ledger._conn.execute("SELECT doc_id, tombstoned_at FROM documents WHERE doc_id = 'd1'").fetchone()
+        assert doc_row[0] == "d1"
+        assert doc_row[1] is not None
+
+        chunk_row = ledger._conn.execute(
+            "SELECT chunk_uid, tombstoned_at FROM chunks WHERE chunk_uid = 'c1'"
+        ).fetchone()
+        assert chunk_row[0] == "c1"
+        assert chunk_row[1] is not None
+
+        # the row genuinely still exists -- get_document still resolves it
+        assert ledger.get_document("d1").doc_id == "d1"
+        assert ledger.count_chunks() == 1
+
+    def test_tombstoning_removes_document_from_live_documents(self, ledger):
+        ledger.upsert_documents([_make_document("d1")])
+        ledger.tombstone_document("d1")
+        assert ledger.live_documents() == []
+
+
+class TestIngestRuns:
+    def test_recording_twice_does_not_duplicate(self, ledger):
+        ledger.record_ingest_run("ir1", source="dev")
+        ledger.record_ingest_run("ir1", source="dev")
+        count = ledger._conn.execute(
+            "SELECT COUNT(*) FROM ingest_runs WHERE ingest_run_id = 'ir1'"
+        ).fetchone()[0]
+        assert count == 1
+
+    def test_finish_unknown_run_raises(self, ledger):
+        with pytest.raises(KeyError):
+            ledger.finish_ingest_run("does-not-exist", n_documents=0, n_errors=0)
+
+    def test_finish_updates_counts(self, ledger):
+        ledger.record_ingest_run("ir2", source="dev")
+        ledger.finish_ingest_run("ir2", n_documents=5, n_errors=1, notes="ok")
+        row = ledger._conn.execute(
+            "SELECT n_documents, n_errors, notes, finished_at FROM ingest_runs WHERE ingest_run_id = 'ir2'"
+        ).fetchone()
+        assert row[0] == 5
+        assert row[1] == 1
+        assert row[2] == "ok"
+        assert row[3] is not None

@@ -39,10 +39,45 @@ from typing import Any
 import duckdb
 import numpy as np
 import orjson
+import pyarrow as pa
 
-from selfrag.schema import RunManifest
+from selfrag.schema import Chunk, Document, Namespace, RunManifest
 
-_CURRENT_SCHEMA_VERSION = 1
+_CURRENT_SCHEMA_VERSION = 2
+
+# Explicit Arrow schemas for the batched upserts below. Typed exactly to the
+# DuckDB column types (see `_create_schema`) rather than left to
+# `pa.Table.from_pylist`'s inference, because an all-null column (e.g. every
+# document in one batch has `tombstoned_at=None`) infers as Arrow's `null`
+# type, which does not implicitly cast into a DuckDB TIMESTAMP column on
+# INSERT -- a real failure mode this project's own dev corpus hits on every
+# document's first ingest, not a hypothetical.
+_DOCUMENTS_ARROW_SCHEMA = pa.schema(
+    [
+        pa.field("doc_id", pa.string()),
+        pa.field("namespace", pa.string()),
+        pa.field("source_url", pa.string()),
+        pa.field("title", pa.string()),
+        pa.field("doc_text_sha256", pa.string()),
+        pa.field("parser_id", pa.string()),
+        pa.field("char_len", pa.int32()),
+        pa.field("acl_key", pa.string()),
+        pa.field("ingest_run_id", pa.string()),
+        pa.field("tombstoned_at", pa.timestamp("us")),
+    ]
+)
+
+_CHUNKS_ARROW_SCHEMA = pa.schema(
+    [
+        pa.field("chunk_uid", pa.string()),
+        pa.field("doc_id", pa.string()),
+        pa.field("chunker_config_id", pa.string()),
+        pa.field("char_start", pa.int32()),
+        pa.field("char_end", pa.int32()),
+        pa.field("raw_text_sha256", pa.string()),
+        pa.field("dup_of", pa.string()),
+    ]
+)
 
 # Columns callers are allowed to order `list_runs` by. Identifiers cannot be
 # passed as bound parameters in SQL, so this whitelist -- not string
@@ -125,6 +160,19 @@ class LedgerConflictError(ValueError):
     callers can catch precisely this failure mode without also catching
     ordinary validation errors.
     """
+
+
+def _migrate_v1_to_v2(conn: duckdb.DuckDBPyConnection) -> None:
+    """v1 -> v2: ``chunks`` gains ``tombstoned_at``, for auditable removal.
+
+    ``Ledger.tombstone_document`` needs a way to mark a document's chunks
+    removed without deleting the rows -- the same "audit trail over
+    deletion" rule ``documents.tombstoned_at`` already follows (see that
+    column and CLAUDE.md's ledger invariants). ``ALTER TABLE ... ADD
+    COLUMN`` is safe whether ``chunks`` already holds rows (DuckDB backfills
+    them with NULL, i.e. "not yet tombstoned") or is still empty.
+    """
+    conn.execute("ALTER TABLE chunks ADD COLUMN tombstoned_at TIMESTAMP")
 
 
 class Ledger:
@@ -219,7 +267,8 @@ class Ledger:
                     char_start         INTEGER NOT NULL,
                     char_end           INTEGER NOT NULL,
                     raw_text_sha256    VARCHAR,
-                    dup_of             VARCHAR
+                    dup_of             VARCHAR,
+                    tombstoned_at      TIMESTAMP
                 )
                 """
             )
@@ -250,13 +299,15 @@ class Ledger:
     def _migrate(self) -> None:
         """Forward-only schema migration hook.
 
-        ``_MIGRATIONS`` maps "version I am upgrading away from" to a function
-        that mutates the schema in place. There is exactly one schema
-        version today, so the loop below runs zero times -- the mechanism is
-        real and will run the day a second version exists, it simply has
-        nothing registered yet.
+        ``migrations`` maps "version I am upgrading away from" to a function
+        that mutates the schema in place. Schema version 2 added
+        ``chunks.tombstoned_at`` (see ``_migrate_v1_to_v2``); a brand-new
+        database never runs it, because ``_create_schema`` above already
+        creates ``chunks`` with that column -- ``migrations`` only fires for
+        a database that was created under an older version and needs to be
+        brought forward.
         """
-        migrations: dict[int, Any] = {}
+        migrations: dict[int, Any] = {1: _migrate_v1_to_v2}
 
         with self._lock:
             row = self._conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
@@ -423,6 +474,248 @@ class Ledger:
                 [run_id, stage, message, ts or _now()],
             )
 
+    # -- ingest runs -----------------------------------------------------
+
+    def record_ingest_run(
+        self, ingest_run_id: str, *, source: str, started_at: datetime | None = None
+    ) -> None:
+        """Insert a new ``ingest_runs`` row, or no-op if this id is already recorded.
+
+        Mirrors ``record_run``'s idempotency (see that method): retrying an
+        ingest that already wrote a bookkeeping row for this
+        ``ingest_run_id`` must not create a second one.
+        """
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT 1 FROM ingest_runs WHERE ingest_run_id = ?", [ingest_run_id]
+            ).fetchone()
+            if existing is not None:
+                return
+            self._conn.execute(
+                """
+                INSERT INTO ingest_runs (ingest_run_id, started_at, source, n_documents, n_errors, notes)
+                VALUES (?, ?, ?, 0, 0, '')
+                """,
+                [ingest_run_id, started_at or _now(), source],
+            )
+
+    def finish_ingest_run(
+        self,
+        ingest_run_id: str,
+        *,
+        n_documents: int,
+        n_errors: int,
+        finished_at: datetime | None = None,
+        notes: str = "",
+    ) -> None:
+        """Record final counts for an ingest run already created by ``record_ingest_run``.
+
+        Idempotent by replacement, like ``finish_run``: calling this again
+        for the same id overwrites the summary fields rather than erroring.
+
+        Raises:
+            KeyError: ``ingest_run_id`` was never recorded.
+        """
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM ingest_runs WHERE ingest_run_id = ?", [ingest_run_id]
+            ).fetchone()
+            if exists is None:
+                raise KeyError(f"unknown ingest_run_id {ingest_run_id!r}; call record_ingest_run() first")
+            self._conn.execute(
+                """
+                UPDATE ingest_runs
+                SET finished_at = ?, n_documents = ?, n_errors = ?, notes = ?
+                WHERE ingest_run_id = ?
+                """,
+                [finished_at or _now(), n_documents, n_errors, notes, ingest_run_id],
+            )
+
+    # -- documents & chunks ------------------------------------------------
+    #
+    # Both upserts are single set-based `INSERT ... ON CONFLICT DO UPDATE`
+    # statements over a registered Arrow table, never one statement per row
+    # (see CLAUDE.md: "100k chunks row-by-row through DuckDB is unusably
+    # slow"). `upsert_chunks` deliberately never writes `tombstoned_at` --
+    # that column is owned exclusively by `tombstone_document`, so
+    # re-upserting a chunk (an ordinary idempotent re-ingest) can never
+    # accidentally clear or overwrite a previously recorded removal.
+
+    def upsert_documents(self, docs: Sequence[Document]) -> None:
+        """Idempotent, batched insert-or-update of ``Document`` rows into ``documents``."""
+        if not docs:
+            return
+        rows = [
+            {
+                "doc_id": d.doc_id,
+                "namespace": d.namespace.value if isinstance(d.namespace, Namespace) else d.namespace,
+                "source_url": d.source_url,
+                "title": d.title,
+                "doc_text_sha256": d.doc_text_sha256,
+                "parser_id": d.parser_id,
+                "char_len": d.char_len,
+                "acl_key": d.acl_key,
+                "ingest_run_id": d.ingest_run_id,
+                "tombstoned_at": d.tombstoned_at,
+            }
+            for d in docs
+        ]
+        table = pa.Table.from_pylist(rows, schema=_DOCUMENTS_ARROW_SCHEMA)
+        with self._lock:
+            self._conn.register("_selfrag_documents_batch", table)
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO documents (
+                        doc_id, namespace, source_url, title, doc_text_sha256,
+                        parser_id, char_len, acl_key, ingest_run_id, tombstoned_at
+                    )
+                    SELECT
+                        doc_id, namespace, source_url, title, doc_text_sha256,
+                        parser_id, char_len, acl_key, ingest_run_id, tombstoned_at
+                    FROM _selfrag_documents_batch
+                    ON CONFLICT (doc_id) DO UPDATE SET
+                        namespace = excluded.namespace,
+                        source_url = excluded.source_url,
+                        title = excluded.title,
+                        doc_text_sha256 = excluded.doc_text_sha256,
+                        parser_id = excluded.parser_id,
+                        char_len = excluded.char_len,
+                        acl_key = excluded.acl_key,
+                        ingest_run_id = excluded.ingest_run_id,
+                        tombstoned_at = excluded.tombstoned_at
+                    """
+                )
+            finally:
+                self._conn.unregister("_selfrag_documents_batch")
+
+    def upsert_chunks(self, chunks: Sequence[Chunk]) -> None:
+        """Idempotent, batched insert-or-update of ``Chunk`` rows into ``chunks``.
+
+        Primary key is ``chunk_uid``, which hashes coordinates only (see
+        ``selfrag.ids.chunk_uid``) -- re-chunking the same frozen canonical
+        text with the same chunker config always produces the same ids, so
+        re-running this over the same corpus updates existing rows in place
+        rather than duplicating them. That is the mechanism the Phase 1 exit
+        criterion depends on.
+        """
+        if not chunks:
+            return
+        rows = [
+            {
+                "chunk_uid": c.chunk_uid,
+                "doc_id": c.doc_id,
+                "chunker_config_id": c.chunker_config_id,
+                "char_start": c.char_start,
+                "char_end": c.char_end,
+                "raw_text_sha256": c.raw_text_sha256,
+                "dup_of": c.dup_of,
+            }
+            for c in chunks
+        ]
+        table = pa.Table.from_pylist(rows, schema=_CHUNKS_ARROW_SCHEMA)
+        with self._lock:
+            self._conn.register("_selfrag_chunks_batch", table)
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO chunks (
+                        chunk_uid, doc_id, chunker_config_id, char_start, char_end,
+                        raw_text_sha256, dup_of
+                    )
+                    SELECT
+                        chunk_uid, doc_id, chunker_config_id, char_start, char_end,
+                        raw_text_sha256, dup_of
+                    FROM _selfrag_chunks_batch
+                    ON CONFLICT (chunk_uid) DO UPDATE SET
+                        doc_id = excluded.doc_id,
+                        chunker_config_id = excluded.chunker_config_id,
+                        char_start = excluded.char_start,
+                        char_end = excluded.char_end,
+                        raw_text_sha256 = excluded.raw_text_sha256,
+                        dup_of = excluded.dup_of
+                    """
+                )
+            finally:
+                self._conn.unregister("_selfrag_chunks_batch")
+
+    def get_chunk_ids(self, doc_id: str | None = None) -> set[str]:
+        """Every ``chunk_uid`` in the ledger, optionally restricted to one document.
+
+        Unfiltered by tombstone status on purpose -- a tombstoned chunk's
+        row still physically exists (see the module docstring's "auditable,
+        not deleted" rule), and this is the primitive the Phase 1 exit
+        criterion's "snapshot the id set, re-ingest, compare" check is built
+        from.
+        """
+        if doc_id is None:
+            rows = self._conn.execute("SELECT chunk_uid FROM chunks").fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT chunk_uid FROM chunks WHERE doc_id = ?", [doc_id]
+            ).fetchall()
+        return {r[0] for r in rows}
+
+    def count_chunks(self) -> int:
+        """Total row count in ``chunks``, tombstoned or not."""
+        return self._conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+
+    def get_document(self, doc_id: str) -> Document:
+        """Fetch one document by id.
+
+        Raises:
+            KeyError: no such doc_id.
+        """
+        row = self._conn.execute(
+            """
+            SELECT doc_id, namespace, source_url, title, doc_text_sha256, parser_id,
+                   char_len, acl_key, ingest_run_id, tombstoned_at
+            FROM documents WHERE doc_id = ?
+            """,
+            [doc_id],
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"unknown doc_id {doc_id!r}")
+        return self._row_to_document(row)
+
+    def live_documents(self) -> list[Document]:
+        """Every document whose ``tombstoned_at`` is unset, ordered by ``doc_id``."""
+        rows = self._conn.execute(
+            """
+            SELECT doc_id, namespace, source_url, title, doc_text_sha256, parser_id,
+                   char_len, acl_key, ingest_run_id, tombstoned_at
+            FROM documents WHERE tombstoned_at IS NULL
+            ORDER BY doc_id
+            """
+        ).fetchall()
+        return [self._row_to_document(row) for row in rows]
+
+    def tombstone_document(self, doc_id: str, *, tombstoned_at: datetime | None = None) -> None:
+        """Mark ``doc_id`` and every one of its chunks removed, without deleting any row.
+
+        A deliberate removal (unlike a document that was simply never seen)
+        has to be distinguishable after the fact, and a re-ingest of the
+        same ``doc_id`` later has to be able to tell the two apart -- that
+        is only possible if the row survives with a marker on it, so this
+        never issues a ``DELETE``.
+
+        Raises:
+            KeyError: ``doc_id`` is not a known document.
+        """
+        ts = tombstoned_at or _now()
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM documents WHERE doc_id = ?", [doc_id]
+            ).fetchone()
+            if exists is None:
+                raise KeyError(f"unknown doc_id {doc_id!r}")
+            self._conn.execute(
+                "UPDATE documents SET tombstoned_at = ? WHERE doc_id = ?", [ts, doc_id]
+            )
+            self._conn.execute(
+                "UPDATE chunks SET tombstoned_at = ? WHERE doc_id = ?", [ts, doc_id]
+            )
+
     def get_run(self, run_id: str) -> RunRecord:
         """Fetch one run by id.
 
@@ -552,4 +845,30 @@ class Ledger:
             p95_ms=p95_ms,
             peak_rss_mb=peak_rss_mb,
             notes=notes or "",
+        )
+
+    def _row_to_document(self, row: tuple[Any, ...]) -> Document:
+        (
+            doc_id,
+            namespace,
+            source_url,
+            title,
+            doc_text_sha256,
+            parser_id,
+            char_len,
+            acl_key,
+            ingest_run_id,
+            tombstoned_at,
+        ) = row
+        return Document(
+            doc_id=doc_id,
+            namespace=Namespace(namespace),
+            source_url=source_url or "",
+            title=title or "",
+            doc_text_sha256=doc_text_sha256 or "",
+            parser_id=parser_id or "",
+            char_len=char_len or 0,
+            acl_key=acl_key or "public",
+            ingest_run_id=ingest_run_id or "",
+            tombstoned_at=tombstoned_at,
         )

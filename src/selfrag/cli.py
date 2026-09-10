@@ -23,6 +23,9 @@ from rich.console import Console
 from rich.table import Table
 
 from selfrag import paths, registry
+from selfrag.ingest import pipeline
+from selfrag.ingest.arxiv_client import ArxivClient
+from selfrag.ingest.manifest import Manifest
 from selfrag.ledger import Ledger
 from selfrag.schema import RunManifest
 
@@ -34,9 +37,17 @@ app = typer.Typer(
 registry_app = typer.Typer(help="Inspect the component registry.", no_args_is_help=True)
 ledger_app = typer.Typer(help="Inspect the experiment ledger.", no_args_is_help=True)
 config_app = typer.Typer(help="Validate pipeline configuration YAML.", no_args_is_help=True)
+ingest_app = typer.Typer(help="Corpus ingest: acquire, parse, chunk, persist.", no_args_is_help=True)
 app.add_typer(registry_app, name="registry")
 app.add_typer(ledger_app, name="ledger")
 app.add_typer(config_app, name="config")
+app.add_typer(ingest_app, name="ingest")
+
+# arXiv's own parser_id constants (selfrag.ingest.latex.PARSER_ID /
+# selfrag.ingest.pdf_fallback.PARSER_ID), duplicated here only as CLI-facing
+# shorthand so `--parser latex|pdf` reads naturally; the actual values
+# compared against ledger rows always come from those modules.
+_PARSER_ID_ALIASES = {"latex": "latex", "pdf": "pdf_fallback"}
 
 console = Console()
 error_console = Console(stderr=True, style="bold red")
@@ -305,6 +316,138 @@ def config_validate(
 
     run_id = manifest.run_id()
     console.print(f"\n[bold green]run_id[/bold green]: {run_id}")
+
+
+def _load_ingest_config(path: Path) -> pipeline.IngestConfig:
+    if not path.is_file():
+        raise _fail(f"no such file: {path}")
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise _fail(f"failed to parse YAML: {exc}") from exc
+    try:
+        return pipeline.IngestConfig.model_validate(raw or {})
+    except ValidationError as exc:
+        raise _fail(f"invalid ingest config: {exc}") from exc
+
+
+def _print_ingest_report(report: pipeline.IngestReport) -> None:
+    table = Table(title="ingest run" + (" (dry run)" if report.dry_run else ""), show_header=False)
+    table.add_column("field", style="bold")
+    table.add_column("value")
+    table.add_row("ingest_run_id", report.ingest_run_id or "(none -- dry run)")
+    table.add_row("corpus_snapshot", report.corpus_snapshot)
+    table.add_row("documents seen", str(report.n_seen))
+    table.add_row("documents acquired", str(report.n_acquired))
+    table.add_row("documents parsed", str(report.n_parsed))
+    table.add_row("documents skipped (already done)", str(report.n_skipped))
+    table.add_row("documents failed", str(report.n_failed))
+    table.add_row("chunks created", str(report.n_chunks_created))
+    table.add_row("chunks marked duplicate", str(report.n_chunks_duplicate))
+    table.add_row("elapsed", f"{report.elapsed_seconds:.2f}s")
+    console.print(table)
+
+    if report.parse_quality:
+        quality_table = Table(title="aggregate parse quality")
+        quality_table.add_column("metric", style="bold")
+        quality_table.add_column("mean")
+        for k, v in report.parse_quality.items():
+            quality_table.add_row(k, f"{v:.4f}")
+        console.print(quality_table)
+
+    if report.failures:
+        console.print("\n[yellow]failures:[/yellow]")
+        for f in report.failures:
+            console.print(f"  - {f.doc_id} [{f.stage}]: {f.reason}")
+
+
+@ingest_app.command("run")
+def ingest_run(
+    config: Annotated[Path, typer.Option("--config", help="ingest pipeline YAML")],
+    limit: Annotated[int | None, typer.Option(help="process at most N documents")] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="report what would happen; write nothing")
+    ] = False,
+) -> None:
+    """Run the full ingest pipeline: acquire, parse, chunk, dedup, persist."""
+    ingest_config = _load_ingest_config(config)
+    manifest_path = pipeline.manifest_path_for(ingest_config.corpus_name)
+
+    if dry_run:
+        report = pipeline.run_ingest(ingest_config, manifest_path=manifest_path, limit=limit, dry_run=True)
+        _print_ingest_report(report)
+        return
+
+    ledger_file = paths.ledger_path()
+    with ArxivClient() as client, Ledger(ledger_file) as ledger:
+        source = pipeline.ArxivDocumentSource(client, max_extracted_bytes=ingest_config.max_extracted_bytes)
+        report = pipeline.run_ingest(
+            ingest_config, source=source, ledger=ledger, manifest_path=manifest_path, limit=limit
+        )
+
+    _print_ingest_report(report)
+    if report.n_failed:
+        raise typer.Exit(code=1)
+
+
+@ingest_app.command("status")
+def ingest_status(
+    corpus_name: Annotated[str, typer.Option(help="corpus name, matching an ingest config's corpus_name")] = "dev",
+) -> None:
+    """Manifest counts by status, chunk/document totals, and the corpus snapshot id."""
+    manifest_path = pipeline.manifest_path_for(corpus_name)
+    manifest = Manifest(manifest_path)
+
+    counts: dict[str, int] = {}
+    for entry in manifest:
+        counts[entry.status.value] = counts.get(entry.status.value, 0) + 1
+
+    table = Table(title=f"ingest status: {corpus_name}", show_header=False)
+    table.add_column("field", style="bold")
+    table.add_column("value")
+    table.add_row("manifest path", str(manifest_path))
+    table.add_row("total documents (manifest)", str(len(manifest)))
+    for status_name in ("pending", "acquired", "parsed", "failed", "tombstoned"):
+        table.add_row(f"  {status_name}", str(counts.get(status_name, 0)))
+    table.add_row("corpus_snapshot", manifest.snapshot_id())
+
+    ledger_file = paths.ledger_path()
+    if ledger_file.exists():
+        with Ledger(ledger_file) as ledger:
+            table.add_row("documents (ledger, live)", str(len(ledger.live_documents())))
+            table.add_row("chunks (ledger)", str(ledger.count_chunks()))
+    else:
+        table.add_row("ledger", "(not yet created)")
+
+    console.print(table)
+
+
+@ingest_app.command("quality")
+def ingest_quality(
+    parser: Annotated[str | None, typer.Option(help="restrict to one parser: latex|pdf")] = None,
+) -> None:
+    """Aggregate, deterministic parse-quality report -- how LaTeX-vs-PDF gets decided from data."""
+    if parser is not None and parser not in _PARSER_ID_ALIASES:
+        raise _fail(f"unknown --parser {parser!r}; valid choices: {sorted(_PARSER_ID_ALIASES)}")
+
+    ledger_file = paths.ledger_path()
+    if not ledger_file.exists():
+        raise _fail(f"no ledger at {ledger_file}; run `selfrag ingest run` first")
+
+    parser_id = _PARSER_ID_ALIASES.get(parser) if parser else None
+    with Ledger(ledger_file) as ledger:
+        report = pipeline.compute_quality_report(ledger, parser_id=parser_id)
+
+    if report is None:
+        console.print("[yellow]no documents to report on[/yellow]")
+        return
+
+    table = Table(title=f"parse quality{f' ({parser})' if parser else ''}")
+    table.add_column("metric", style="bold")
+    table.add_column("mean")
+    for k, v in report.items():
+        table.add_row(k, f"{v:.4f}")
+    console.print(table)
 
 
 def main() -> None:

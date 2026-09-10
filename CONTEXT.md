@@ -1,6 +1,6 @@
 # selfrag — context
 
-**Last updated:** 2026-09-09 · **Repo:** https://github.com/MudMonster341/Self_RAG ·
+**Last updated:** 2026-09-10 · **Repo:** https://github.com/MudMonster341/Self_RAG ·
 **Local:** `C:\Users\Mustafa\Desktop\Mustafa\Projects\P_RAG` · **Package:** `selfrag`
 
 Read this first. Then [MEMORY.md](MEMORY.md) for what just happened, and
@@ -28,12 +28,12 @@ uncovered.
 
 ## Current state
 
-**Phase 0 — Foundations. Complete** (2026-09-09).
+**Phase 0 — Foundations. Complete** (2026-09-09). **Phase 1 — Ingest pipeline. Complete** (2026-09-10).
 
-**223 tests pass**, `ruff check .` is clean, and `scripts/check_no_fake_code.py` reports 0
+**495 tests pass**, `ruff check .` is clean, and `scripts/check_no_fake_code.py` reports 0
 violations and 0 escapes across `src/`.
 
-Landed:
+Landed in Phase 0:
 
 | Module | What it does |
 |---|---|
@@ -45,18 +45,42 @@ Landed:
 | `paths.py`, `cli.py` | Path resolution; `doctor`, `registry list`, `ledger`, `config validate`. |
 | `scripts/`, `.github/` | No-fake-code gate and CI. |
 
+Landed in Phase 1 (`src/selfrag/ingest/`):
+
+| Module | What it does |
+|---|---|
+| `manifest.py`, `arxiv_client.py`, `eprint.py` | Corpus manifest; rate-limited arXiv client; e-print fetch + extraction. |
+| `latex.py`, `pdf_fallback.py` | LaTeX-source parser (primary); PyMuPDF PDF parser (fallback), same `ParsedDocument` shape. |
+| `canonical.py` | Freezes parsed text once; `get_span` is the only read path for offsets. |
+| `dedup.py` | arXiv version collapsing + MinHash/LSH chunk near-dup detection. |
+| `quality.py` | Deterministic, no-LLM parse-quality metrics — the LaTeX-vs-PDF decision data. |
+| `pipeline.py` | **The orchestrator.** Wires all of the above into one idempotent, resumable flow (see below). |
+| `ledger.py` (extended) | `upsert_documents`/`upsert_chunks` (batched upserts), `get_chunk_ids`, `count_chunks`, `get_document`, `live_documents`, `tombstone_document`, `record_ingest_run`/`finish_ingest_run`. Schema now v2 (`chunks.tombstoned_at`). |
+| `cli.py` (extended) | `selfrag ingest run/status/quality`. |
+
 `selfrag config validate configs/baseline.yaml` resolves both stages and produces a concrete
 `run_id`. **Phase 0's exit criterion is met.**
 
-There is no corpus and no retrieval yet — that is Phase 1, and it is the next thing.
-Phases 0–3 need **zero API keys**.
+**Phase 1's exit criterion is met and proven in
+[tests/integration/test_ingest_idempotency.py](tests/integration/test_ingest_idempotency.py):
+running ingest twice over the same documents produces zero new chunk ids** — checked as id-set
+identity, zero duplicate ledger rows, identical canonical text hashes, identical document rows,
+zero new manifest rows, and zero re-acquisition, across two and then three consecutive runs.
+Idempotency works by leaning on manifest status (`PARSED`/`ACQUIRED` skip re-fetching and
+re-parsing) rather than any new tracking layer — see `pipeline.py`'s module docstring and
+[ADR 0006](decisions/0006-span-integrity-failure-aborts-ingest-rather-than-dead-lettering.md).
+
+There is no real corpus ingested yet (`configs/ingest.yaml` names one placeholder doc_id) and no
+retrieval yet — retrieval is Phase 2. Phases 0–3 need **zero API keys**; Phase 1's `ingest run`
+does call the live arXiv API when not run with `--dry-run`, subject to the 1-req/3s throttle
+already enforced by `arxiv_client.py`.
 
 ⚠ **Unpushed.** Commits are local only; `git push` needs a one-time interactive credential
 login (Git Credential Manager opens a browser). Until then GitHub is not a backup.
 
-⚠ **RAM is tighter than planned.** `selfrag doctor` measured **1.12 GB available** against the
-3 GB the local-model tier assumes. Measure the dev-corpus size and ORT thread count on a quiet
-machine before trusting the plan's throughput arithmetic.
+⚠ **RAM is still tight.** `selfrag doctor` measures **~1.2–1.3 GB available** against the 3 GB
+the local-model tier assumes — unchanged since Phase 0. Measure the dev-corpus size and ORT
+thread count on a quiet machine before trusting the plan's throughput arithmetic.
 
 ## How to run it
 
