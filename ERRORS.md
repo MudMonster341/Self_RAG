@@ -101,3 +101,50 @@ fire time before assuming the task's own logic was at fault.
 unattended-overnight assumption depends on the laptop not sleeping; power settings need
 checking before the first long run") and then not acted on before scheduling. Identifying a
 risk is not mitigating it.
+
+---
+
+## ERR-0003 — arXiv moved its OAI-PMH endpoint; 65 mocked tests could not see it (2026-09-10)
+
+**Symptom:**
+
+```
+httpx.HTTPStatusError: Redirect response '301 Unknown Error' for url
+  'http://export.arxiv.org/oai2?verb=ListRecords&...'
+Redirect location: 'https://oaipmh.arxiv.org/oai?verb=ListRecords&...'
+```
+
+The acquisition layer had 65 passing tests, including transport-level tests for retries,
+`Retry-After`, rate limiting and resumption tokens. Not one of them could fail this way: they
+all use `httpx.MockTransport`, and **a mock cannot notice that the real endpoint has moved.**
+The first request to the actual internet failed instantly.
+
+**Root cause:** two independent gaps.
+
+1. The long-documented `http://export.arxiv.org/oai2` now 301-redirects to
+   `https://oaipmh.arxiv.org/oai`. The constant was stale.
+2. `httpx.Client` does not follow redirects by default, so the 301 surfaced as an error
+   rather than being followed.
+
+**Fix:** point `OAI_PMH_URL` at the current host directly (not merely following the
+redirect — at one request per three seconds, an extra round trip per page is expensive over a
+multi-hour harvest), and set `follow_redirects=True` so a future move degrades to a slow
+harvest instead of a dead one. Redirected requests still pass through the shared rate limiter,
+so this cannot be used to exceed arXiv's rate limit.
+
+**Two follow-on facts, learned from the same live run:**
+
+- Valid set specs are `cs`, `cs:cs`, and `cs:cs:IR` (183 sets total). `cs:cs:IR` is the
+  target category for this project.
+- `from`/`until` filter on the OAI **datestamp**, not the submission date, and granularity is
+  `YYYY-MM-DD`. A single-day window returns `noRecordsMatch` far more often than expected —
+  which is not an error, and the harvester correctly reported `completed=True, rows=0`.
+- The OAI header id (`oai:arXiv.org:2505.16532`) carries **no version suffix**, so version
+  resolution will rarely fire from this source; versions come from the abs/e-print path
+  instead. Not a bug, but it means the `v10 > v9` logic is exercised by e-print acquisition,
+  not by metadata harvest.
+
+**How to recognise this next time:** a fully-mocked test suite proves the code is
+self-consistent, not that it talks to the real thing. Any module whose job is to call an
+external service needs at least one live smoke test before it is believed. Budget one real
+request; it found this in four seconds.
